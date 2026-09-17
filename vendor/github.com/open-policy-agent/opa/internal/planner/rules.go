@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/v1/ast"
 )
 
 // funcstack implements a simple map structure used to keep track of virtual
@@ -98,6 +98,7 @@ func (t *ruletrie) Rules() []*ast.Rule {
 		//
 		// and we're retrieving a.b, we want Rules() to include the rule body
 		// of a.b.c.
+		// FIXME: We need to go deeper than just immediate children (?)
 		for _, rs := range t.children {
 			if r := rs[len(rs)-1].rules; r != nil {
 				rules = append(rules, r...)
@@ -110,7 +111,7 @@ func (t *ruletrie) Rules() []*ast.Rule {
 
 func (t *ruletrie) Push(key ast.Ref) {
 	node := t
-	for i := 0; i < len(key)-1; i++ {
+	for i := range len(key) - 1 {
 		node = node.Get(key[i].Value)
 		if node == nil {
 			return
@@ -122,7 +123,7 @@ func (t *ruletrie) Push(key ast.Ref) {
 
 func (t *ruletrie) Pop(key ast.Ref) {
 	node := t
-	for i := 0; i < len(key)-1; i++ {
+	for i := range len(key) - 1 {
 		node = node.Get(key[i].Value)
 		if node == nil {
 			return
@@ -157,11 +158,44 @@ func (t *ruletrie) Lookup(key ast.Ref) *ruletrie {
 	return node
 }
 
+func (t *ruletrie) LookupShallowest(key ast.Ref) *ruletrie {
+	node := t
+	for _, elem := range key {
+		node = node.Get(elem.Value)
+		if node == nil {
+			return nil
+		}
+		if len(node.rules) > 0 {
+			return node
+		}
+	}
+	return node
+}
+
+// TODO: Collapse rules with overlapping extent to same node(?)
 func (t *ruletrie) LookupOrInsert(key ast.Ref) *ruletrie {
-	if val := t.Lookup(key); val != nil {
+	if val := t.LookupShallowest(key); val != nil {
+
 		return val
 	}
 	return t.Insert(key)
+}
+
+func (t *ruletrie) DescendantRules() []*ast.Rule {
+	if len(t.children) == 0 {
+		return t.rules
+	}
+
+	rules := make([]*ast.Rule, len(t.rules), len(t.rules)+len(t.children)) // could be too little
+	copy(rules, t.rules)
+
+	for _, cs := range t.children {
+		for _, c := range cs {
+			rules = append(rules, c.DescendantRules()...)
+		}
+	}
+
+	return rules
 }
 
 func (t *ruletrie) ChildrenCount() int {
