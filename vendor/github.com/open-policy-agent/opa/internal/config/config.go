@@ -12,14 +12,14 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/ghodss/yaml"
+	"sigs.k8s.io/yaml"
 
 	"github.com/open-policy-agent/opa/internal/strvals"
-	"github.com/open-policy-agent/opa/keys"
-	"github.com/open-policy-agent/opa/logging"
-	"github.com/open-policy-agent/opa/plugins/rest"
-	"github.com/open-policy-agent/opa/tracing"
-	"github.com/open-policy-agent/opa/util"
+	"github.com/open-policy-agent/opa/v1/keys"
+	"github.com/open-policy-agent/opa/v1/logging"
+	"github.com/open-policy-agent/opa/v1/plugins/rest"
+	"github.com/open-policy-agent/opa/v1/tracing"
+	"github.com/open-policy-agent/opa/v1/util"
 )
 
 // ServiceOptions stores the options passed to ParseServicesConfig
