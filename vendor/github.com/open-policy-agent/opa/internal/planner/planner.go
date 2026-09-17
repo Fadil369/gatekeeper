@@ -11,10 +11,10 @@ import (
 	"io"
 	"sort"
 
-	"github.com/open-policy-agent/opa/ast"
-	"github.com/open-policy-agent/opa/ast/location"
 	"github.com/open-policy-agent/opa/internal/debug"
-	"github.com/open-policy-agent/opa/ir"
+	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/ast/location"
+	"github.com/open-policy-agent/opa/v1/ir"
 )
 
 // QuerySet represents the input to the planner.
@@ -25,6 +25,8 @@ type QuerySet struct {
 }
 
 type planiter func() error
+type planLocalIter func(ir.Local) error
+type stmtFactory func(ir.Local) ir.Stmt
 
 // Planner implements a query planner for Rego queries.
 type Planner struct {
@@ -147,32 +149,31 @@ func (p *Planner) buildFunctrie() error {
 		}
 
 		for _, rule := range module.Rules {
-			r := rule.Ref()
-			switch r[len(r)-1].Value.(type) {
-			case ast.String: // pass
-			default: // cut off
-				r = r[:len(r)-1]
-			}
+			r := rule.Ref().StringPrefix()
 			val := p.rules.LookupOrInsert(r)
+
+			val.rules = val.DescendantRules()
 			val.rules = append(val.rules, rule)
+			val.children = nil
 		}
 	}
 	return nil
 }
 
 func (p *Planner) planRules(rules []*ast.Rule) (string, error) {
+	// We know the rules with closer to the root (shorter static path) are ordered first.
 	pathRef := rules[0].Ref()
 
 	// figure out what our rules' collective name/path is:
 	// if we're planning both p.q.r and p.q[s], we'll name
 	// the function p.q (for the mapping table)
-	// TODO(sr): this has to change when allowing `p[v].q.r[w]` ref rules
-	// including the mapping lookup structure and lookup functions
 	pieces := len(pathRef)
 	for i := range rules {
 		r := rules[i].Ref()
-		if _, ok := r[len(r)-1].Value.(ast.String); !ok {
-			pieces = len(r) - 1
+		for j, t := range r {
+			if _, ok := t.Value.(ast.String); !ok && j > 0 && j < pieces {
+				pieces = j
+			}
 		}
 	}
 	// control if p.a = 1 is to return 1 directly; or insert 1 under key "a" into an object
@@ -222,7 +223,7 @@ func (p *Planner) planRules(rules []*ast.Rule) (string, error) {
 	}
 
 	// Initialize parameters for functions.
-	for i := 0; i < len(rules[0].Head.Args); i++ {
+	for range len(rules[0].Head.Args) {
 		fn.Params = append(fn.Params, p.newLocal())
 	}
 
@@ -236,7 +237,11 @@ func (p *Planner) planRules(rules []*ast.Rule) (string, error) {
 			fn.Blocks = append(fn.Blocks, p.blockWithStmt(&ir.MakeObjectStmt{Target: fn.Return}))
 		}
 	case ast.MultiValue:
-		fn.Blocks = append(fn.Blocks, p.blockWithStmt(&ir.MakeSetStmt{Target: fn.Return}))
+		if buildObject {
+			fn.Blocks = append(fn.Blocks, p.blockWithStmt(&ir.MakeObjectStmt{Target: fn.Return}))
+		} else {
+			fn.Blocks = append(fn.Blocks, p.blockWithStmt(&ir.MakeSetStmt{Target: fn.Return}))
+		}
 	}
 
 	// For complete document rules, allocate one local variable for output
@@ -251,6 +256,12 @@ func (p *Planner) planRules(rules []*ast.Rule) (string, error) {
 
 	var defaultRule *ast.Rule
 	var ruleLoc *location.Location
+
+	// We sort rules by ref length, to ensure that when merged, we can detect conflicts when one
+	// rule attempts to override values (deep and shallow) defined by another rule.
+	sort.Slice(rules, func(i, j int) bool {
+		return len(rules[i].Ref()) > len(rules[j].Ref())
+	})
 
 	// Generate function blocks for rules.
 	for i := range rules {
@@ -320,18 +331,19 @@ func (p *Planner) planRules(rules []*ast.Rule) (string, error) {
 					switch rule.Head.RuleKind() {
 					case ast.SingleValue:
 						if buildObject {
-							ref := rule.Head.Ref()
-							last := ref[len(ref)-1]
-							return p.planTerm(last, func() error {
-								key := p.ltarget
-								return p.planTerm(rule.Head.Value, func() error {
-									value := p.ltarget
-									p.appendStmt(&ir.ObjectInsertOnceStmt{
-										Object: fn.Return,
-										Key:    key,
-										Value:  value,
+							ref := rule.Ref()
+							return p.planTerm(rule.Head.Value, func() error {
+								value := p.ltarget
+								return p.planNestedObjects(fn.Return, ref[pieces:len(ref)-1], func(obj ir.Local) error {
+									return p.planTerm(ref[len(ref)-1], func() error {
+										key := p.ltarget
+										p.appendStmt(&ir.ObjectInsertOnceStmt{
+											Object: obj,
+											Key:    key,
+											Value:  value,
+										})
+										return nil
 									})
-									return nil
 								})
 							})
 						}
@@ -343,6 +355,28 @@ func (p *Planner) planRules(rules []*ast.Rule) (string, error) {
 							return nil
 						})
 					case ast.MultiValue:
+						if buildObject {
+							ref := rule.Ref()
+							// we drop the trailing set key from the ref
+							return p.planNestedObjects(fn.Return, ref[pieces:len(ref)-1], func(obj ir.Local) error {
+								// Last term on rule ref is the key an which the set is assigned in the deepest nested object
+								return p.planTerm(ref[len(ref)-1], func() error {
+									key := p.ltarget
+									return p.planTerm(rule.Head.Key, func() error {
+										value := p.ltarget
+										factory := func(v ir.Local) ir.Stmt { return &ir.MakeSetStmt{Target: v} }
+										return p.planDotOr(obj, key, factory, func(set ir.Local) error {
+											p.appendStmt(&ir.SetAddStmt{
+												Set:   set,
+												Value: value,
+											})
+											p.appendStmt(&ir.ObjectInsertStmt{Key: key, Value: op(set), Object: obj})
+											return nil
+										})
+									})
+								})
+							})
+						}
 						return p.planTerm(rule.Head.Key, func() error {
 							p.appendStmt(&ir.SetAddStmt{
 								Set:   fn.Return,
@@ -351,7 +385,7 @@ func (p *Planner) planRules(rules []*ast.Rule) (string, error) {
 							return nil
 						})
 					default:
-						return fmt.Errorf("illegal rule kind")
+						return errors.New("illegal rule kind")
 					}
 				})
 			})
@@ -420,6 +454,62 @@ func (p *Planner) planRules(rules []*ast.Rule) (string, error) {
 	p.loc = ploc
 
 	return fn.Name, nil
+}
+
+func (p *Planner) planDotOr(obj ir.Local, key ir.Operand, or stmtFactory, iter planLocalIter) error {
+	// We're constructing the following plan:
+	//
+	// | block a
+	// | | block b
+	// | | | dot &{Source:Local<obj> Key:{Value:Local<key>} Target:Local<val>}
+	// | | | break 1
+	// | | or &{Target:Local<val>}
+	// | iter &{Target:Local<val>} # may update Local<val>.
+	// | *ir.ObjectInsertStmt &{Key:{Value:Local<key>} Value:{Value:Local<val>} Object:Local<obj>}
+
+	prev := p.curr
+	dotBlock := &ir.Block{}
+	p.curr = dotBlock
+
+	val := p.newLocal()
+	p.appendStmt(&ir.DotStmt{
+		Source: op(obj),
+		Key:    key,
+		Target: val,
+	})
+	p.appendStmt(&ir.BreakStmt{Index: 1})
+
+	outerBlock := &ir.Block{
+		Stmts: []ir.Stmt{
+			&ir.BlockStmt{Blocks: []*ir.Block{dotBlock}}, // FIXME: Set Location
+			or(val),
+		},
+	}
+
+	p.curr = prev
+	p.appendStmt(&ir.BlockStmt{Blocks: []*ir.Block{outerBlock}})
+	if err := iter(val); err != nil {
+		return err
+	}
+	p.appendStmt(&ir.ObjectInsertStmt{Key: key, Value: op(val), Object: obj})
+	return nil
+}
+
+func (p *Planner) planNestedObjects(obj ir.Local, ref ast.Ref, iter planLocalIter) error {
+	if len(ref) == 0 {
+		return iter(obj)
+	}
+
+	t := ref[0]
+
+	return p.planTerm(t, func() error {
+		key := p.ltarget
+
+		factory := func(v ir.Local) ir.Stmt { return &ir.MakeObjectStmt{Target: v} }
+		return p.planDotOr(obj, key, factory, func(childObj ir.Local) error {
+			return p.planNestedObjects(childObj, ref[1:], iter)
+		})
+	})
 }
 
 func (p *Planner) planFuncParams(params []ir.Local, args ast.Args, idx int, iter planiter) error {
@@ -754,13 +844,29 @@ func (p *Planner) dataRefsShadowRuletrie(refs []ast.Ref) bool {
 }
 
 func (p *Planner) planExprTerm(e *ast.Expr, iter planiter) error {
-	return p.planTerm(e.Terms.(*ast.Term), func() error {
-		p.appendStmt(&ir.NotEqualStmt{
-			A: p.ltarget,
-			B: op(ir.Bool(false)),
+	// NOTE(sr): There are only three cases to deal with when we see a naked term
+	// in a rule body:
+	//  1. it's `false` -- so we can stop, emit a break stmt
+	//  2. it's a var or a ref, like `input` or `data.foo.bar`, where we need to
+	//     check what it ends up being (at run time) to determine if it's not false
+	//  3. it's any other term -- `true`, a string, a number, whatever. We can skip
+	//     that, since it's true-ish enough for evaluating the rule body.
+	switch t := e.Terms.(*ast.Term).Value.(type) {
+	case ast.Boolean:
+		if !bool(t) { // We know this cannot hold, break unconditionally
+			p.appendStmt(&ir.BreakStmt{})
+			return iter()
+		}
+	case ast.Ref, ast.Var: // We don't know these at plan-time
+		return p.planTerm(e.Terms.(*ast.Term), func() error {
+			p.appendStmt(&ir.NotEqualStmt{
+				A: p.ltarget,
+				B: op(ir.Bool(false)),
+			})
+			return iter()
 		})
-		return iter()
-	})
+	}
+	return iter()
 }
 
 func (p *Planner) planExprEvery(e *ast.Expr, iter planiter) error {
@@ -786,6 +892,40 @@ func (p *Planner) planExprEvery(e *ast.Expr, iter planiter) error {
 	})
 
 	err := p.planTerm(every.Domain, func() error {
+		// Assert that the domain is a collection type:
+		// block outer
+		//   block a
+		//     isArray
+		//     br 1: break outer, and continue
+		//   block b
+		//     isObject
+		//     br 1: break outer, and continue
+		//   block c
+		//     isSet
+		//     br 1: break outer, and continue
+		//   br 1: invalid domain, break every
+
+		aBlock := &ir.Block{}
+		p.appendStmtToBlock(&ir.IsArrayStmt{Source: p.ltarget}, aBlock)
+		p.appendStmtToBlock(&ir.BreakStmt{Index: 1}, aBlock)
+
+		bBlock := &ir.Block{}
+		p.appendStmtToBlock(&ir.IsObjectStmt{Source: p.ltarget}, bBlock)
+		p.appendStmtToBlock(&ir.BreakStmt{Index: 1}, bBlock)
+
+		cBlock := &ir.Block{}
+		p.appendStmtToBlock(&ir.IsSetStmt{Source: p.ltarget}, cBlock)
+		p.appendStmtToBlock(&ir.BreakStmt{Index: 1}, cBlock)
+
+		outerBlock := &ir.BlockStmt{Blocks: []*ir.Block{
+			{
+				Stmts: []ir.Stmt{
+					&ir.BlockStmt{Blocks: []*ir.Block{aBlock, bBlock, cBlock}},
+					&ir.BreakStmt{Index: 1}},
+			},
+		}}
+		p.appendStmt(outerBlock)
+
 		return p.planScan(every.Key, func(ir.Local) error {
 			p.appendStmt(&ir.ResetLocalStmt{
 				Target: cond1,
@@ -850,8 +990,7 @@ func (p *Planner) planExprCall(e *ast.Expr, iter planiter) error {
 		op := e.Operator()
 
 		if replacement := p.mocks.Lookup(operator); replacement != nil {
-			switch r := replacement.Value.(type) {
-			case ast.Ref:
+			if r, ok := replacement.Value.(ast.Ref); ok {
 				if !r.HasPrefix(ast.DefaultRootRef) && !r.HasPrefix(ast.InputRootRef) {
 					// replacement is builtin
 					operator = r.String()
@@ -896,7 +1035,7 @@ func (p *Planner) planExprCall(e *ast.Expr, iter planiter) error {
 			args = p.defaultOperands()
 		} else if decl, ok := p.decls[operator]; ok {
 			relation = decl.Relation
-			arity = len(decl.Decl.Args())
+			arity = decl.Decl.Arity()
 			void = decl.Decl.Result() == nil
 			name = operator
 			p.externs[operator] = decl
@@ -1006,7 +1145,7 @@ func (p *Planner) planExprCallFunc(name string, arity int, void bool, operands [
 		})
 
 	default:
-		return fmt.Errorf("impossible replacement, arity mismatch")
+		return errors.New("impossible replacement, arity mismatch")
 	}
 }
 
@@ -1032,7 +1171,7 @@ func (p *Planner) planExprCallValue(value *ast.Term, arity int, operands []*ast.
 			})
 		})
 	default:
-		return fmt.Errorf("impossible replacement, arity mismatch")
+		return errors.New("impossible replacement, arity mismatch")
 	}
 }
 
@@ -1116,6 +1255,24 @@ func (p *Planner) planUnifyVar(a ast.Var, b *ast.Term, iter planiter) error {
 }
 
 func (p *Planner) planUnifyLocal(a ir.Operand, b *ast.Term, iter planiter) error {
+	// special cases: when a is StringIndex or Bool, and b is a string, or a bool, we can shortcut
+	switch va := a.Value.(type) {
+	case ir.StringIndex:
+		if vb, ok := b.Value.(ast.String); ok {
+			if va != ir.StringIndex(p.getStringConst(string(vb))) {
+				p.appendStmt(&ir.BreakStmt{})
+			}
+			return iter() // Don't plan EqualStmt{A: "foo", B: "foo"}
+		}
+	case ir.Bool:
+		if vb, ok := b.Value.(ast.Boolean); ok {
+			if va != ir.Bool(vb) {
+				p.appendStmt(&ir.BreakStmt{})
+			}
+			return iter() // Don't plan EqualStmt{A: true, B: true}
+		}
+	}
+
 	switch vb := b.Value.(type) {
 	case ast.Null, ast.Boolean, ast.Number, ast.String, ast.Ref, ast.Set, *ast.SetComprehension, *ast.ArrayComprehension, *ast.ObjectComprehension:
 		return p.planTerm(b, func() error {
@@ -1360,11 +1517,11 @@ func (p *Planner) planValue(t ast.Value, loc *ast.Location, iter planiter) error
 		p.loc = loc
 		return p.planObjectComprehension(v, iter)
 	default:
-		return fmt.Errorf("%v term not implemented", ast.TypeName(v))
+		return fmt.Errorf("%v term not implemented", ast.ValueName(v))
 	}
 }
 
-func (p *Planner) planNull(null ast.Null, iter planiter) error {
+func (p *Planner) planNull(_ ast.Null, iter planiter) error {
 
 	target := p.newLocal()
 
@@ -1591,7 +1748,7 @@ func (p *Planner) planRef(ref ast.Ref, iter planiter) error {
 
 	head, ok := ref[0].Value.(ast.Var)
 	if !ok {
-		return fmt.Errorf("illegal ref: non-var head")
+		return errors.New("illegal ref: non-var head")
 	}
 
 	if head.Compare(ast.DefaultRootDocument.Value) == 0 {
@@ -1608,7 +1765,7 @@ func (p *Planner) planRef(ref ast.Ref, iter planiter) error {
 
 	p.ltarget, ok = p.vars.GetOp(head)
 	if !ok {
-		return fmt.Errorf("illegal ref: unsafe head")
+		return errors.New("illegal ref: unsafe head")
 	}
 
 	return p.planRefRec(ref, 1, iter)
@@ -2206,6 +2363,10 @@ func rewrittenVar(vars map[ast.Var]ast.Var, k ast.Var) ast.Var {
 	return rw
 }
 
+func dont() ([][]*ast.Rule, []ir.Operand, int, bool) {
+	return nil, nil, 0, false
+}
+
 // optimizeLookup returns a set of rulesets and required statements planning
 // the locals (strings) needed with the used local variables, and the index
 // into ref's parth that is still to be planned; if the passed ref's vars
@@ -2222,9 +2383,6 @@ func rewrittenVar(vars map[ast.Var]ast.Var, k ast.Var) ast.Var {
 // var actually matched_ -- so we don't know which subtree to evaluate
 // with the results.
 func (p *Planner) optimizeLookup(t *ruletrie, ref ast.Ref) ([][]*ast.Rule, []ir.Operand, int, bool) {
-	dont := func() ([][]*ast.Rule, []ir.Operand, int, bool) {
-		return nil, nil, 0, false
-	}
 	if t == nil {
 		p.debugf("no optimization of %s: trie is nil", ref)
 		return dont()
@@ -2252,6 +2410,10 @@ outer:
 			opt = true
 			// take all children, they might match
 			for _, node := range nodes {
+				if nr := node.Rules(); len(nr) > 0 {
+					p.debugf("no optimization of %s: node with rules (%v)", ref, refsOfRules(nr))
+					return dont()
+				}
 				for _, child := range node.Children() {
 					if node := node.Get(child); node != nil {
 						nextNodes = append(nextNodes, node)
@@ -2259,8 +2421,12 @@ outer:
 				}
 			}
 		case ast.String:
-			// take all children that either match or have a var key
+			// take all children that either match or have a var key // TODO(sr): Where's the code for the second part, having a var key?
 			for _, node := range nodes {
+				if nr := node.Rules(); len(nr) > 0 {
+					p.debugf("no optimization of %s: node with rules (%v)", ref, refsOfRules(nr))
+					return dont()
+				}
 				if node := node.Get(r); node != nil {
 					nextNodes = append(nextNodes, node)
 				}
@@ -2279,10 +2445,20 @@ outer:
 		// let us break, too.
 		all := 0
 		for _, node := range nodes {
-			all += node.ChildrenCount()
+			if i < len(ref)-1 {
+				// Look ahead one term to only count those children relevant to your planned ref.
+				switch ref[i+1].Value.(type) {
+				case ast.Var:
+					all += node.ChildrenCount()
+				default:
+					if relChildren := node.Get(ref[i+1].Value); relChildren != nil {
+						all++
+					}
+				}
+			}
 		}
 		if all == 0 {
-			p.debugf("ref %s: all nodes have 0 children, break", ref[0:index+1])
+			p.debugf("ref %s: all nodes have 0 relevant children, break", ref[0:index+1])
 			break
 		}
 
@@ -2390,4 +2566,12 @@ func (p *Planner) isFunction(r ast.Ref) bool {
 
 func op(v ir.Val) ir.Operand {
 	return ir.Operand{Value: v}
+}
+
+func refsOfRules(rs []*ast.Rule) []string {
+	refs := make([]string, len(rs))
+	for i := range rs {
+		refs[i] = rs[i].Head.Ref().String()
+	}
+	return refs
 }
